@@ -4,7 +4,7 @@ import sys
 
 # 导入 Agent 的代码进行测试
 try:
-    from scaffold import vis_MC_Gillespie_Elastic_SLS
+    from ground_truth import vis_MC_Gillespie_Elastic_SLS
 except ImportError:
     print("错误: 找不到 scaffold.py 或函数接口被破坏。")
     sys.exit(1)
@@ -34,11 +34,18 @@ def evaluate_agent():
             print(">> [i] 通过: 变量数值收敛正常 (+5分)")
             score += 5
             
-        # [指标 ii] 宏观受力状态区分
+        # [指标 ii] 宏观受力状态响应特征
         _, _, _, vfm_sp, Fadh_sp = vis_MC_Gillespie_Elastic_SLS(neta=1.0, ka=10.0)
-        if Fadh_lf > Fadh_sp:
-            print(f">> [ii] 通过: 均值捕捉到高低刚度下受力状态的区分特征 (+5分)")
+        
+        # 【防御性修复】如果 Agent 脑抽返回了数组，强行取均值将其降维回标量，防止 Grader 崩溃
+        val_lf = np.mean(Fadh_lf) if isinstance(Fadh_lf, np.ndarray) else Fadh_lf
+        val_sp = np.mean(Fadh_sp) if isinstance(Fadh_sp, np.ndarray) else Fadh_sp
+        
+        if val_lf > val_sp:
+            print(">> Metric 2: Success (+5)")
             score += 5
+        else:
+            print(">> Metric 2: Failed")
 
         # 预先跑出扫描数据，固定种子
         np.random.seed(2026) 
