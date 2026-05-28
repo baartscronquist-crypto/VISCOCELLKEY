@@ -4,7 +4,7 @@ import sys
 
 # 导入 Agent 的代码进行测试
 try:
-    from ground_truth import vis_MC_Gillespie_Elastic_SLS
+    from scaffold import vis_MC_Gillespie_Elastic_SLS
 except ImportError:
     print("错误: 找不到 scaffold.py 或函数接口被破坏。")
     sys.exit(1)
