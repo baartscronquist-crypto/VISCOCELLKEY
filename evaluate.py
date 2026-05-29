@@ -99,8 +99,20 @@ except BaseException:
 # 导入真值基准
 try:
     from ground_truth import vis_MC_Gillespie_Elastic_SLS as vis_GT
-except ImportError:
+except ModuleNotFoundError as exc:
+    if exc.name != "ground_truth":
+        _emit("错误: ground_truth.py 的依赖导入失败，无法执行真实 RMSE 评测。")
+        if os.environ.get("EVALUATOR_DEBUG") == "1":
+            _OS_WRITE(2, traceback.format_exc().encode("utf-8", errors="replace"))
+        _emit_final_score(0)
+        sys.exit(0)
     vis_GT = None
+except BaseException:
+    _emit("错误: ground_truth.py 导入时崩溃，无法执行真实 RMSE 评测。")
+    if os.environ.get("EVALUATOR_DEBUG") == "1":
+        _OS_WRITE(2, traceback.format_exc().encode("utf-8", errors="replace"))
+    _emit_final_score(0)
+    sys.exit(0)
 
 
 def _call_agent(**kwargs):

@@ -1,6 +1,10 @@
 import numpy as np
-import matplotlib.pyplot as plt
 import time
+
+try:
+    import matplotlib.pyplot as plt
+except ModuleNotFoundError:
+    plt = None
 
 # ==========================================
 # 核心函数：完全复刻您提供的最新 MATLAB 源码
@@ -92,6 +96,9 @@ def vis_MC_Gillespie_Elastic_SLS(neta, ka, kl=0.1):
 # 主执行程序与画图
 # ==========================================
 if __name__ == "__main__":
+    if plt is None:
+        raise RuntimeError("matplotlib is required to run plotting examples")
+
     plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
     plt.rcParams['axes.unicode_minus'] = False
     
