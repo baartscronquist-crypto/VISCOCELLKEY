@@ -160,12 +160,119 @@ def _is_dynamic_timeseries(T, vf, Fsub):
     return True
 
 
+def _finite_scalar(value):
+    arr = np.asarray(value, dtype=float).reshape(-1)
+    if arr.size != 1 or not np.isfinite(arr[0]):
+        raise ValueError("expected a finite scalar")
+    return float(arr[0])
+
+
+def _safe_corrcoef(a, b):
+    a_arr = np.asarray(a, dtype=float).reshape(-1)
+    b_arr = np.asarray(b, dtype=float).reshape(-1)
+    if a_arr.size != b_arr.size or a_arr.size < 3:
+        return 0.0
+    if not (np.all(np.isfinite(a_arr)) and np.all(np.isfinite(b_arr))):
+        return 0.0
+    if np.std(a_arr) <= 1e-12 or np.std(b_arr) <= 1e-12:
+        return 0.0
+    return float(np.corrcoef(a_arr, b_arr)[0, 1])
+
+
+def _estimate_sawtooth_period(T, vf, grid_dt=0.5):
+    """Estimate the mean load-fail wavelength from repeated high-vf bursts."""
+    try:
+        t_arr = np.asarray(T, dtype=float).reshape(-1)
+        vf_arr = np.asarray(vf, dtype=float).reshape(-1)
+    except Exception:
+        return {
+            "period": np.nan,
+            "cv": np.inf,
+            "count": 0,
+            "amplitude": 0.0,
+        }
+
+    valid = np.isfinite(t_arr) & np.isfinite(vf_arr)
+    t_arr = t_arr[valid]
+    vf_arr = vf_arr[valid]
+    if t_arr.size < 20 or t_arr.size != vf_arr.size:
+        return {
+            "period": np.nan,
+            "cv": np.inf,
+            "count": 0,
+            "amplitude": 0.0,
+        }
+
+    order = np.argsort(t_arr)
+    t_arr = t_arr[order]
+    vf_arr = vf_arr[order]
+    unique = np.r_[True, np.diff(t_arr) > 1e-9]
+    t_arr = t_arr[unique]
+    vf_arr = vf_arr[unique]
+    if t_arr.size < 20 or t_arr[-1] - t_arr[0] < 100.0:
+        return {
+            "period": np.nan,
+            "cv": np.inf,
+            "count": 0,
+            "amplitude": 0.0,
+        }
+
+    grid = np.arange(t_arr[0], t_arr[-1] + 1e-9, grid_dt)
+    if grid.size < 20:
+        return {
+            "period": np.nan,
+            "cv": np.inf,
+            "count": 0,
+            "amplitude": 0.0,
+        }
+
+    values = np.interp(grid, t_arr, vf_arr)
+    window = 5
+    smoothed = np.convolve(values, np.ones(window) / window, mode="same")
+    amplitude = float(np.percentile(smoothed, 90) - np.percentile(smoothed, 10))
+    threshold = float(np.percentile(smoothed, 80))
+    high = smoothed >= threshold
+    starts = np.flatnonzero(high & np.r_[True, ~high[:-1]])
+
+    times = []
+    for t_val in grid[starts]:
+        if t_val < grid[0] + 5.0:
+            continue
+        if not times or t_val - times[-1] >= 3.0:
+            times.append(float(t_val))
+
+    if len(times) < 3:
+        return {
+            "period": np.nan,
+            "cv": np.inf,
+            "count": len(times),
+            "amplitude": amplitude,
+        }
+
+    intervals = np.diff(times)
+    mean_period = float(np.mean(intervals))
+    cv = float(np.std(intervals) / mean_period) if mean_period > 0 else np.inf
+    return {
+        "period": mean_period,
+        "cv": cv,
+        "count": len(times),
+        "amplitude": amplitude,
+    }
+
+
+def _scan_vfmean(ka, neta_scan):
+    values = []
+    np.random.seed(2026)
+    for neta in neta_scan:
+        values.append(_finite_scalar(_call_agent(neta=neta, ka=ka)[3]))
+    return np.asarray(values, dtype=float)
+
+
 def evaluate_agent():
     score = 0
-    _emit("开始执行 10 项高阶动力学指标评测 (基于 vu - vf 标准, 满分 100)...\n")
+    _emit("开始执行 10 项高阶动力学指标评测 (基于 vfmean 物理形态, 满分 100)...\n")
 
-    neta_scan = np.logspace(np.log10(0.01), np.log10(100), 20)
-    vu = 120  # 动力学基础聚合速度
+    neta_scan = np.logspace(np.log10(0.01), np.log10(100), 10)
 
     try:
         # ====================================================================
@@ -183,54 +290,83 @@ def evaluate_agent():
 
         # [指标 ii] 宏观受力状态区分
         _, _, _, vfm_sp, Fadh_sp = _call_agent(neta=1.0, ka=10.0)
-        if Fadh_lf > Fadh_sp:
-            _emit(f">> [ii] 通过: 均值捕捉到高低刚度下受力状态的区分特征 (+5分)")
-            score += 5
-
-        # 预先跑出扫描数据，固定种子
-        np.random.seed(2026)
-        vfm_list_01, vfm_list_10 = [], []
-        for n in neta_scan:
-            vfm_list_01.append(_call_agent(neta=n, ka=0.1)[3])
-            vfm_list_10.append(_call_agent(neta=n, ka=10.0)[3])
-
-        # 🚩 【核心转换】：将 vf 转换为图上的 vu - vf (净速度)
-        net_v_01 = vu - np.array(vfm_list_01)
-        net_v_10 = vu - np.array(vfm_list_10)
-
-        # [指标 iii] 弱基底极值检测 (此时 vf 有微小隆起，意味着 vu - vf 有一个微小凹陷/极小值)
-        if np.min(net_v_01) < net_v_01[0]:
-            _emit(">> [iii] 通过: 弱基底扫描探测到微小的净速度特征起伏 (+5分)")
-            score += 5
-        else:
-            _emit(">> [iii] 失败: 弱基底扫描未见明显下凹，未能复现净速度特征起伏。")
-
-        # [指标 iv] 强基底平稳收敛检测：允许 KMC 小噪声，但不允许显著反向回弹。
-        net_v_10_diff = np.diff(net_v_10)
-        tail_std_10 = np.std(net_v_10[-5:])
-        is_regular_strong_substrate = (
-            net_v_10[-1] < net_v_10[0]
-            and np.max(net_v_10_diff) < 3.0
-            and tail_std_10 < 1.0
-        )
-        if is_regular_strong_substrate:
-            _emit(">> [iv] 通过: 强基底净速度呈稳定收敛趋势，未出现异常反向回弹 (+5分)")
+        Fadh_lf = _finite_scalar(Fadh_lf)
+        Fadh_sp = _finite_scalar(Fadh_sp)
+        if Fadh_lf > Fadh_sp + 20.0:
+            _emit(
+                f">> [ii] 通过: 高低刚度黏附力状态区分明确 "
+                f"(ka=0.1: {Fadh_lf:.1f}, ka=10: {Fadh_sp:.1f}) (+5分)"
+            )
             score += 5
         else:
             _emit(
-                f">> [iv] 失败: 强基底净速度未稳定收敛 "
-                f"(max_diff={np.max(net_v_10_diff):.2f}, tail_std={tail_std_10:.2f})"
+                f">> [ii] 失败: 高低刚度黏附力差异不足 "
+                f"(ka=0.1: {Fadh_lf:.1f}, ka=10: {Fadh_sp:.1f})"
             )
 
-        # [指标 v] 单点绝对精度误差 (针对 vu - vf)
-        # 你的起始位置在 80 左右 (即 120 - 40)
-        test_net_v = net_v_01[0]
-        gt_point = (vu - vis_GT(neta=0.01, ka=0.1)[3]) if vis_GT else 83.0
-        if abs(test_net_v - gt_point) / gt_point <= 0.15:
-            _emit(f">> [v] 通过: 单点绝对精度误差 < 15% (目标值 {gt_point:.1f}, 当前值 {test_net_v:.1f}) (+5分)")
+        # 预先跑出扫描数据，固定种子。这里直接考 vfmean，不再把它转成 vu-vf。
+        vfm_scan = {
+            0.1: _scan_vfmean(0.1, neta_scan),
+            0.5: _scan_vfmean(0.5, neta_scan),
+            1.0: _scan_vfmean(1.0, neta_scan),
+            10.0: _scan_vfmean(10.0, neta_scan),
+        }
+        vfm_01 = vfm_scan[0.1]
+        vfm_10 = vfm_scan[10.0]
+
+        # [指标 iii] 低刚度 ka=0.1 的 vfmean 必须先下降再恢复，极小值在低 neta 段。
+        min_idx_01 = int(np.argmin(vfm_01))
+        weak_depth_left = float(vfm_01[0] - vfm_01[min_idx_01])
+        weak_recovery = float(np.mean(vfm_01[-5:]) - vfm_01[min_idx_01])
+        weak_min_neta = float(neta_scan[min_idx_01])
+        if 1 <= min_idx_01 <= 6 and weak_depth_left > 3.0 and weak_recovery > 5.0:
+            _emit(
+                f">> [iii] 通过: ka=0.1 的 vfmean 出现低 neta 谷值 "
+                f"(neta={weak_min_neta:.3g}, depth={weak_depth_left:.1f}, recovery={weak_recovery:.1f}) (+5分)"
+            )
             score += 5
         else:
-            _emit(f">> [v] 失败: 单点偏差过大 (目标值 {gt_point:.1f}, 当前值 {test_net_v:.1f})")
+            _emit(
+                f">> [iii] 失败: ka=0.1 的 vfmean 谷值位置/深度不符 "
+                f"(neta={weak_min_neta:.3g}, depth={weak_depth_left:.1f}, recovery={weak_recovery:.1f})"
+            )
+
+        # [指标 iv] 强基底 ka=10 的 vfmean 应随 neta 明显上升，而不是高位平线或随机抖动。
+        strong_head = float(np.mean(vfm_10[:5]))
+        strong_tail = float(np.mean(vfm_10[-5:]))
+        strong_rise = strong_tail - strong_head
+        strong_corr = _safe_corrcoef(np.log10(neta_scan), vfm_10)
+        if strong_head < 65.0 and strong_tail > 90.0 and strong_rise > 35.0 and strong_corr > 0.70:
+            _emit(
+                f">> [iv] 通过: ka=10 的 vfmean 随 neta 显著上升 "
+                f"(head={strong_head:.1f}, tail={strong_tail:.1f}, corr={strong_corr:.2f}) (+5分)"
+            )
+            score += 5
+        else:
+            _emit(
+                f">> [iv] 失败: ka=10 的 vfmean 不是真值中的上升趋势 "
+                f"(head={strong_head:.1f}, tail={strong_tail:.1f}, rise={strong_rise:.1f}, corr={strong_corr:.2f})"
+            )
+
+        # [指标 v] 单点绝对精度误差 (直接针对 vfmean)
+        test_vfm = float(vfm_01[0])
+        if vis_GT is not None:
+            np.random.seed(2026)
+            gt_point = _finite_scalar(vis_GT(neta=0.01, ka=0.1)[3])
+        else:
+            gt_point = 38.0
+        rel_err = abs(test_vfm - gt_point) / max(abs(gt_point), 1e-9)
+        if rel_err <= 0.10:
+            _emit(
+                f">> [v] 通过: vfmean 单点绝对精度误差 <= 10% "
+                f"(目标值 {gt_point:.1f}, 当前值 {test_vfm:.1f}, rel={rel_err:.2%}) (+5分)"
+            )
+            score += 5
+        else:
+            _emit(
+                f">> [v] 失败: vfmean 单点偏差过大 "
+                f"(目标值 {gt_point:.1f}, 当前值 {test_vfm:.1f}, rel={rel_err:.2%})"
+            )
 
         _emit(f"\n目前阶段得分: {score}/25")
 
@@ -239,89 +375,111 @@ def evaluate_agent():
         # ====================================================================
         _emit("\n--- [阶段二] 高阶形态学拓扑与全维关联 ---")
 
-        # [指标 vi] 自相关周期性检验
-        peak_ac = _autocorr_peak(vf_lf)
-        if peak_ac > 0.15:
-            _emit(f">> 通过: 检测到明确的宏观周期性 (次级峰={peak_ac:.2f}) (+15分)")
+        # [指标 vi] 低刚度周期锯齿波的平均波长/周期检验
+        period_info = _estimate_sawtooth_period(T_lf, vf_lf)
+        period = period_info["period"]
+        cycle_count = period_info["count"]
+        cycle_cv = period_info["cv"]
+        amplitude = period_info["amplitude"]
+        if (
+            np.isfinite(period)
+            and 12.0 <= period <= 24.0
+            and cycle_count >= 35
+            and cycle_cv <= 0.45
+            and amplitude >= 45.0
+        ):
+            _emit(
+                f">> [vi] 通过: ka=0.1 周期锯齿波平均波长正确 "
+                f"(period={period:.1f}s, cycles={cycle_count}, cv={cycle_cv:.2f}, amp={amplitude:.1f}) (+15分)"
+            )
             score += 15
         else:
-            _emit(f">> 失败: 速度曲线丧失宏观周期性。")
+            _emit(
+                f">> [vi] 失败: ka=0.1 周期锯齿波平均波长不符 "
+                f"(period={period:.1f}s, cycles={cycle_count}, cv={cycle_cv:.2f}, amp={amplitude:.1f})"
+            )
 
         # [指标 vii] 力-速度交叉相关性检验
         # 无论怎么相减，力与速度的制约关系是不变的
-        correlation = np.corrcoef(np.array(vf_lf), np.array(Fsub_lf))[0, 1]
+        correlation = _safe_corrcoef(vf_lf, Fsub_lf)
         if correlation < -0.8:
-            _emit(f">> 通过: 速度与离合器牵引力呈现强物理负耦合 (Pearson r={correlation:.2f}) (+15分)")
+            _emit(f">> [vii] 通过: 速度与离合器牵引力呈现强物理负耦合 (Pearson r={correlation:.2f}) (+15分)")
             score += 15
         else:
-            _emit(f">> 失败: 速度与牵引力失去镜像制约。")
+            _emit(f">> [vii] 失败: 速度与牵引力失去镜像制约 (Pearson r={correlation:.2f})。")
 
-        # 🚩 [指标 viii] 修正：弱基底(ka=0.1)全局拓扑形态检验
-        _emit("\n[指标 viii] 正在分析弱基底净速度曲线的全局拓扑...")
-        left_mean_01 = np.mean(net_v_01[:5])
-        right_mean_01 = np.mean(net_v_01[-5:])
-        min_01 = np.min(net_v_01)
-
-        _emit(f"===== 弱基底(vu - vf) 调试信息 =====")
-        _emit(f"起始净速度均值 left_mean_01 = {left_mean_01:.2f}")
-        _emit(f"全局最低净速度 min_01 = {min_01:.2f}")
-        _emit(f"尾部净速度均值 right_mean_01 = {right_mean_01:.2f}")
-
-        # 转换为你的物理实际：
-        # 1. 你的 vf 始终在 40 左右，意味着 vu - vf 始终在 80 左右
-        # 2. 尾部均值应该稳定在 60 ~ 95 之间
-        if (right_mean_01 > 70.0) and (right_mean_01 < 85.0):
-            _emit(f">> 通过: 弱基底曲线符合“始终维持在高位平台”的当前仿真拓扑 (+15分)")
+        # [指标 viii] ka 增大时，低刚度 vfmean 极小值点必须向右移动。
+        _emit("\n[指标 viii] 正在分析 ka=0.1/0.5/1 的 vfmean 极小值右移...")
+        low_ka_values = [0.1, 0.5, 1.0]
+        min_indices = [int(np.argmin(vfm_scan[ka])) for ka in low_ka_values]
+        min_netas = [float(neta_scan[idx]) for idx in min_indices]
+        valley_depths = [
+            float(np.mean(vfm_scan[ka][:3]) - np.min(vfm_scan[ka]))
+            for ka in low_ka_values
+        ]
+        right_shift_ok = min_netas[0] < min_netas[1] < min_netas[2]
+        expected_bands_ok = (
+            min_netas[0] < 0.20
+            and 0.10 <= min_netas[1] <= 1.50
+            and 0.50 <= min_netas[2] <= 5.00
+        )
+        depth_ok = valley_depths[0] > 2.0 and valley_depths[1] > 8.0 and valley_depths[2] > 8.0
+        _emit(
+            f"极小值 neta: ka=0.1->{min_netas[0]:.3g}, "
+            f"ka=0.5->{min_netas[1]:.3g}, ka=1->{min_netas[2]:.3g}"
+        )
+        _emit(
+            f"谷值深度: ka=0.1->{valley_depths[0]:.1f}, "
+            f"ka=0.5->{valley_depths[1]:.1f}, ka=1->{valley_depths[2]:.1f}"
+        )
+        if right_shift_ok and expected_bands_ok and depth_ok:
+            _emit(">> [viii] 通过: ka 增大导致 vfmean 极小值点按真值向右移动 (+15分)")
             score += 15
         else:
-            _emit(f">> 失败: 弱基底拓扑超出合理区间。")
+            _emit(">> [viii] 失败: vfmean 极小值没有随 ka 增大按真值右移。")
 
-        # 🚩 [指标 ix] 修正：强基底(ka=10)断崖式变动检验
-        _emit("\n[指标 ix] 正在分析强基底曲线在 neta=1 附近的台阶上升特征...")
-        # ==============================================
-        # 核心：动态找到 neta 最接近 1 的位置（全自动，不写死索引）
-        # ==============================================
-        neta_arr = neta_scan  # 替换成你代码里的x轴neta数组（必须！）
-        idx_neta1 = np.argmin(np.abs(neta_arr - 1))  # 找到neta=1对应的数组索引
+        # [指标 ix] 强基底 ka=10 的全局上升趋势和高 neta 平台。
+        _emit("\n[指标 ix] 正在分析 ka=10 的 vfmean 全局上升趋势...")
+        strong_tail_std = float(np.std(vfm_10[-4:]))
+        if (
+            strong_head < 65.0
+            and strong_tail > 95.0
+            and strong_rise > 45.0
+            and strong_corr > 0.80
+            and strong_tail_std < 2.0
+        ):
+            _emit(
+                f">> [ix] 通过: ka=10 从低速区上升到高 neta 平台 "
+                f"(head={strong_head:.1f}, tail={strong_tail:.1f}, rise={strong_rise:.1f}, tail_std={strong_tail_std:.2f}) (+15分)"
+            )
+            score += 15
+        else:
+            _emit(
+                f">> [ix] 失败: ka=10 全局曲线不像真值的上升-平台形态 "
+                f"(head={strong_head:.1f}, tail={strong_tail:.1f}, rise={strong_rise:.1f}, corr={strong_corr:.2f}, tail_std={strong_tail_std:.2f})"
+            )
 
-        # ==============================================
-        # 动态取平台：neta<1（断崖前） + neta>1（断崖后）
-        # ==============================================
-        # 低阻尼平台：neta=1 左侧 5 个点（稳定低位区）
-        plateau_low = vu-np.mean(net_v_10[idx_neta1 - 5 : idx_neta1])
-        # 高阻尼平台：neta=1 右侧 5 个点（稳定高位区）
-        plateau_high = vu-np.mean(net_v_10[idx_neta1 : idx_neta1 + 5])
-
-        # ==============================================
-        # 计算阶跃幅度 + 判分
-        # ==============================================
+        # [指标 x] 强基底 ka=10 在 neta=1 附近应有大幅阶跃突变。
+        _emit("\n[指标 x] 正在分析 ka=10 在 neta=1 附近的 vfmean 阶跃...")
+        idx_neta1 = int(np.argmin(np.abs(np.log10(neta_scan))))
+        left_slice = vfm_10[max(0, idx_neta1 - 4):idx_neta1]
+        right_slice = vfm_10[idx_neta1:min(vfm_10.size, idx_neta1 + 4)]
+        plateau_low = float(np.mean(left_slice))
+        plateau_high = float(np.mean(right_slice))
         step = plateau_high - plateau_low
-        _emit(f"精准定位 neta≈1 位置: 数组索引 {idx_neta1}")
-        _emit(f"低阻尼平台(neta<1): {plateau_low:.1f} | 高阻尼平台(neta>1): {plateau_high:.1f} | 阶跃幅度: {step:.1f}")
-
-        # 你的断崖幅度有30左右，阈值>15完全够用
-        if step > 15.0:
-            _emit(f">> 通过: 强基底在neta=1附近观测到标志性阶跃上升 (+15分)")
+        local_jump = float(vfm_10[min(idx_neta1 + 1, vfm_10.size - 1)] - vfm_10[max(idx_neta1 - 1, 0)])
+        _emit(
+            f"精准定位 neta≈1 位置: 数组索引 {idx_neta1}, neta={neta_scan[idx_neta1]:.3g}"
+        )
+        _emit(
+            f"左平台={plateau_low:.1f} | 右平台={plateau_high:.1f} | "
+            f"阶跃幅度={step:.1f} | 局部跳变={local_jump:.1f}"
+        )
+        if plateau_low < 75.0 and plateau_high > 80.0 and step > 25.0 and local_jump > 20.0:
+            _emit(">> [x] 通过: ka=10 在 neta≈1 附近复现大幅阶跃上升 (+15分)")
             score += 15
         else:
-            _emit(f">> 失败: 未检测到neta=1附近的有效阶跃")
-        # [指标 x] 全频段 RMSE 距离检验
-        _emit("\n[指标 x] 正在计算全频段动力学演化的 L2 RMSE 误差范数...")
-        if vis_GT is not None:
-            gt_net_list = []
-            np.random.seed(2026)
-            for n in neta_scan:
-                gt_net_list.append(vu - vis_GT(neta=n, ka=0.1)[3])
-
-            rmse = np.sqrt(np.mean((net_v_01 - np.array(gt_net_list))**2))
-            if rmse < 15.0:  # 针对转换后的尺度适当放宽门槛
-                _emit(f">> 通过: 整体曲线与图表高度吻合 (全域 RMSE={rmse:.2f}) (+15分)")
-                score += 15
-            else:
-                _emit(f">> 失败: 整体曲线偏差过大 (全域 RMSE={rmse:.2f} > 15.0)")
-        else:
-            _emit(">> 提示: 未检测到真值模块，RMSE 全域拟合项默认通过 (+15分)。")
-            score += 15
+            _emit(">> [x] 失败: 未检测到 ka=10 在 neta≈1 附近的有效阶跃。")
 
     except Exception:
         _emit("\n>> 最终判定: 运行期间发生未知程序崩溃，评分置 0。")
