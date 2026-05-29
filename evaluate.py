@@ -4,6 +4,7 @@ import sys
 import os
 import contextlib
 import builtins
+import signal
 
 _TRUSTED_STDOUT = sys.stdout
 _TRUSTED_STDERR = sys.stderr
@@ -15,6 +16,12 @@ _OPEN = builtins.open
 _DEVNULL = os.devnull
 _RESULT_PREFIX = "EVALUATOR_FINAL_SCORE"
 _TRUSTED_STDOUT_FD = _OS_DUP(1)
+_IMPORT_TIMEOUT_SECONDS = float(os.environ.get("EVALUATOR_IMPORT_TIMEOUT_SECONDS", "10"))
+_CALL_TIMEOUT_SECONDS = float(os.environ.get("EVALUATOR_CALL_TIMEOUT_SECONDS", "15"))
+
+
+class _EvaluatorTimeout(TimeoutError):
+    pass
 
 
 def _emit(message=""):
@@ -33,6 +40,27 @@ def _flush_streams():
             stream.flush()
         except Exception:
             pass
+
+
+@contextlib.contextmanager
+def _time_limit(seconds, label):
+    if seconds <= 0:
+        yield
+        return
+
+    def _handle_timeout(signum, frame):
+        raise _EvaluatorTimeout(f"{label} timed out after {seconds:g}s")
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    old_timer = signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+        if old_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, old_timer[0], old_timer[1])
 
 
 @contextlib.contextmanager
@@ -58,8 +86,9 @@ def _suppress_untrusted_output():
 
 # 导入 Agent 的代码进行测试
 try:
-    with _suppress_untrusted_output():
-        from scaffold import vis_MC_Gillespie_Elastic_SLS as _agent_vis_MC_Gillespie_Elastic_SLS
+    with _time_limit(_IMPORT_TIMEOUT_SECONDS, "scaffold import"):
+        with _suppress_untrusted_output():
+            from scaffold import vis_MC_Gillespie_Elastic_SLS as _agent_vis_MC_Gillespie_Elastic_SLS
 except BaseException:
     _emit("错误: 找不到 scaffold.py、函数接口被破坏或导入时崩溃。")
     if os.environ.get("EVALUATOR_DEBUG") == "1":
@@ -75,8 +104,49 @@ except ImportError:
 
 
 def _call_agent(**kwargs):
-    with _suppress_untrusted_output():
-        return _agent_vis_MC_Gillespie_Elastic_SLS(**kwargs)
+    with _time_limit(_CALL_TIMEOUT_SECONDS, f"agent call {kwargs}"):
+        with _suppress_untrusted_output():
+            return _agent_vis_MC_Gillespie_Elastic_SLS(**kwargs)
+
+
+def _autocorr_peak(values, max_points=4000):
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    if arr.size <= 20:
+        return 0.0
+    if arr.size > max_points:
+        idx = np.linspace(0, arr.size - 1, max_points).astype(int)
+        arr = arr[idx]
+    centered = arr - np.mean(arr)
+    zero_lag = float(np.dot(centered, centered))
+    if zero_lag <= 0.0 or not np.isfinite(zero_lag):
+        return 0.0
+    autocorr = np.correlate(centered, centered, mode='full')
+    autocorr = autocorr[len(autocorr)//2:] / zero_lag
+    if autocorr.size <= 10:
+        return 0.0
+    return float(np.max(autocorr[10:]))
+
+
+def _is_dynamic_timeseries(T, vf, Fsub):
+    try:
+        T_arr = np.asarray(T, dtype=float).reshape(-1)
+        vf_arr = np.asarray(vf, dtype=float).reshape(-1)
+        f_arr = np.asarray(Fsub, dtype=float).reshape(-1)
+    except Exception:
+        return False
+
+    if not (T_arr.size == vf_arr.size == f_arr.size):
+        return False
+    if T_arr.size < 20:
+        return False
+    if not (np.all(np.isfinite(T_arr)) and np.all(np.isfinite(vf_arr)) and np.all(np.isfinite(f_arr))):
+        return False
+    if T_arr[-1] <= T_arr[0] or np.any(np.diff(T_arr) < 0):
+        return False
+    if np.std(vf_arr) <= 1e-8 or np.std(f_arr) <= 1e-8:
+        return False
+    return True
+
 
 def evaluate_agent():
     score = 0
@@ -93,9 +163,11 @@ def evaluate_agent():
 
         # [指标 i] 数值正常与防 NaN 爆炸
         T_lf, vf_lf, Fsub_lf, vfm_lf, Fadh_lf = _call_agent(neta=1.0, ka=0.1)
-        if not (np.any(np.isnan(vf_lf)) or np.any(np.isinf(vf_lf))):
-            _emit(">> [i] 通过: 变量数值收敛正常 (+5分)")
+        if _is_dynamic_timeseries(T_lf, vf_lf, Fsub_lf):
+            _emit(">> [i] 通过: 时序长度、有限性与动态变化均正常 (+5分)")
             score += 5
+        else:
+            _emit(">> [i] 失败: 输出不是有效的动态时序。")
 
         # [指标 ii] 宏观受力状态区分
         _, _, _, vfm_sp, Fadh_sp = _call_agent(neta=1.0, ka=10.0)
@@ -156,10 +228,7 @@ def evaluate_agent():
         _emit("\n--- [阶段二] 高阶形态学拓扑与全维关联 ---")
 
         # [指标 vi] 自相关周期性检验
-        vf_centered = np.array(vf_lf) - np.mean(vf_lf)
-        autocorr = np.correlate(vf_centered, vf_centered, mode='full')
-        autocorr = autocorr[len(autocorr)//2:] / autocorr[len(autocorr)//2]
-        peak_ac = np.max(autocorr[10:])
+        peak_ac = _autocorr_peak(vf_lf)
         if peak_ac > 0.15:
             _emit(f">> 通过: 检测到明确的宏观周期性 (次级峰={peak_ac:.2f}) (+15分)")
             score += 15
